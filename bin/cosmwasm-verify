@@ -1,0 +1,86 @@
+#!/bin/bash
+set -o errexit -o nounset -o pipefail
+
+# This is fixed by convention for all builders
+COSMWASM_VERIFY_SRC="$(realpath "$(dirname "$0")")/../src"
+MOUNTPOINT_CODE="/code"
+
+function sha256() {
+  FILE="$1"
+
+  if command -v sha256sum > /dev/null ; then
+    sha256sum "$FILE" | head -c 64
+    echo # linebreak
+    return
+  fi
+
+  if command -v shasum > /dev/null ; then
+    shasum -a 256 "$FILE" | head -c 64
+    echo # linebreak
+    return
+  fi
+
+  echo "No SHA-256 implementation found"
+  return 6
+}
+
+function print_usage() {
+  echo "Usage: cosmwasm-verify GITHUB_ORG GITHUB_REPO GITHUB_COMMIT CONTRACT_NAME BUILDER_IMAGE EXPECTED_CHECKSUM"
+}
+
+if [ "${1:-}" == "--help" ]; then
+  print_usage
+  exit 0
+fi
+
+if [ "$#" -ne 6 ]; then
+  echo "Error: Script must be called with exactly 6 arguments."
+  echo ""
+  print_usage
+  exit 42
+fi
+
+GITHUB_ORG="$1"
+GITHUB_REPO="$2"
+GITHUB_COMMIT="$3"
+CONTRACT_NAME="$4"
+BUILDER_IMAGE="$5"
+EXPECTED_CHECKSUM="$6"
+
+SOURCE_URL="https://github.com/$GITHUB_ORG/$GITHUB_REPO"
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cosmwasm_verify.XXXXXXXXX")
+SOURCE_DIR="$TMP_DIR/source"
+mkdir "$SOURCE_DIR"
+
+(
+  cd "$SOURCE_DIR"
+
+  # Clone repo
+  DOWNLOAD_DIR="$TMP_DIR/repo"
+  git clone "$SOURCE_URL" "$DOWNLOAD_DIR"
+
+  # Reset to the given commit hash
+  cd "$DOWNLOAD_DIR"
+  git reset --hard "$GITHUB_COMMIT"
+
+  # Make cache key from unique string
+  CACHE_KEY="cosmwasm_verify_cache_$(echo -n "$GITHUB_ORG $GITHUB_REPO $GITHUB_COMMIT" | sha256sum | xxd -p -c 999999)"
+
+  docker run --rm \
+    -v "$(pwd)":/code \
+    --mount type=volume,source="$CACHE_KEY",target=/code/target \
+    --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
+    "$BUILDER_IMAGE"
+
+  # Make checksum of a single wasm contract file
+  CHECKSUM=$(sha256 artifacts/$CONTRACT_NAME.wasm)
+
+  if [ "$CHECKSUM" == "$EXPECTED_CHECKSUM" ]; then
+    echo "{\"success\": \"true\"}"
+    exit 0
+  else
+    echo "{\"success\": \"false\"}"
+    exit 0
+  fi
+)
